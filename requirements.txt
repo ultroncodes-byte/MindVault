@@ -2,3 +2,5 @@ groq
 httpx
 python-telegram-bot>=20.0
 pypdf
+beautifulsoup4
+lxml
