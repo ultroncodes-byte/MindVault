@@ -5,6 +5,7 @@ import logging
 import threading
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Optional, List, Dict, Any, Tuple
 from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -19,47 +20,18 @@ UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY")
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# In-memory tutor session store
-tutor_sessions = {}
+# In-memory stores
+tutor_sessions: Dict[int, Dict[str, Any]] = {}
+topic_sessions: Dict[int, Dict[str, Any]] = {}
 
 
-# ─── INTERNET ARCHIVE SEARCH (text only) ─────────────────────────────────────
-async def search_internet_archive(topic: str) -> list:
-    url = "https://archive.org/advancedsearch.php"
-    params = {
-        "q": f"{topic} AND mediatype:texts",
-        "fl[]": ["identifier", "title", "mediatype"],
-        "rows": 5,
-        "page": 1,
-        "output": "json",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, params=params)
-            data = resp.json()
-            docs = data.get("response", {}).get("docs", [])
-            results = []
-            for doc in docs[:5]:
-                identifier = doc.get("identifier", "")
-                title = doc.get("title", "No title")
-                link = f"https://archive.org/details/{identifier}"
-                results.append({
-                    "title": title,
-                    "link": link,
-                    "type": "texts",
-                    "identifier": identifier
-                })
-            return results
-    except Exception as e:
-        logger.error(f"Internet Archive error: {e}")
-        return []
+# ─── SEARCH APIS (reliable and fast) ──────────────────────────────────────
 
-
-# ─── PROJECT GUTENBERG SEARCH ─────────────────────────────────────────────────
-async def search_gutenberg(topic: str) -> list:
+async def search_gutenberg(topic: str) -> List[Dict[str, Optional[str]]]:
+    """Search Project Gutenberg via gutendex.com (free, fast, returns downloadable formats)."""
     url = f"https://gutendex.com/books/?search={topic}"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(url)
             data = resp.json()
             books = data.get("results", [])
@@ -69,17 +41,14 @@ async def search_gutenberg(topic: str) -> list:
                 authors = book.get("authors", [])
                 author = authors[0]["name"] if authors else "Unknown"
                 formats = book.get("formats", {})
-                # Get PDF or epub link
-                pdf_url = formats.get("application/pdf", "")
-                epub_url = formats.get("application/epub+zip", "")
-                html_url = formats.get("text/html", "")
-                read_link = pdf_url or epub_url or html_url
+                # Prefer PDF, then EPUB, then HTML
+                download_url = formats.get("application/pdf") or formats.get("application/epub+zip") or formats.get("text/html")
                 book_id = book.get("id")
                 page_link = f"https://www.gutenberg.org/ebooks/{book_id}"
                 results.append({
                     "title": f"{title} — {author}",
                     "link": page_link,
-                    "download": pdf_url or epub_url,
+                    "download": download_url,
                 })
             return results
     except Exception as e:
@@ -87,11 +56,11 @@ async def search_gutenberg(topic: str) -> list:
         return []
 
 
-# ─── OPEN LIBRARY SEARCH ──────────────────────────────────────────────────────
-async def search_open_library(topic: str) -> list:
+async def search_open_library(topic: str) -> List[Dict[str, Optional[str]]]:
+    """Search Open Library for books with full text."""
     url = f"https://openlibrary.org/search.json?q={topic}&limit=3&has_fulltext=true"
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=8) as client:
             resp = await client.get(url)
             data = resp.json()
             docs = data.get("docs", [])
@@ -104,6 +73,7 @@ async def search_open_library(topic: str) -> list:
                 results.append({
                     "title": f"{title} — {author}",
                     "link": link,
+                    "download": None,   # Open Library does not provide direct PDF download via API easily
                 })
             return results
     except Exception as e:
@@ -111,28 +81,13 @@ async def search_open_library(topic: str) -> list:
         return []
 
 
-# ─── DOWNLOAD PDF FROM GUTENBERG ──────────────────────────────────────────────
-async def download_gutenberg_pdf(download_url: str) -> bytes | None:
-    if not download_url:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(download_url)
-            if resp.status_code == 200:
-                return resp.content
-        return None
-    except Exception as e:
-        logger.error(f"Gutenberg download error: {e}")
-        return None
-
-
-# ─── UNSPLASH IMAGE ──────────────────────────────────────────────────────────
-async def fetch_unsplash_image(topic: str):
+async def fetch_unsplash_image(topic: str) -> Tuple[Optional[str], Optional[str]]:
+    """Get a landscape photo from Unsplash."""
     url = "https://api.unsplash.com/search/photos"
     params = {"query": topic, "per_page": 1, "orientation": "landscape"}
     headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(url, params=params, headers=headers)
             data = resp.json()
             results = data.get("results", [])
@@ -146,15 +101,15 @@ async def fetch_unsplash_image(topic: str):
 
 
 # ─── GROQ SUMMARIZER ─────────────────────────────────────────────────────────
-def summarize_with_groq(topic: str, archive: list, gutenberg: list, openlibrary: list) -> str:
-    archive_text = "\n".join([f"- {r['title']}: {r['link']}" for r in archive]) or "None"
+
+def summarize_with_groq(topic: str, gutenberg: List[Dict], openlibrary: List[Dict]) -> str:
+    """Generate a learning summary from the found resources."""
     gutenberg_text = "\n".join([f"- {r['title']}: {r['link']}" for r in gutenberg]) or "None"
     openlibrary_text = "\n".join([f"- {r['title']}: {r['link']}" for r in openlibrary]) or "None"
 
     prompt = f"""You are MindVault, an expert AI learning assistant. The user wants to learn: "{topic}"
 
 Resources found:
-Internet Archive: {archive_text}
 Project Gutenberg: {gutenberg_text}
 Open Library: {openlibrary_text}
 
@@ -165,17 +120,49 @@ Write a learning summary with:
 
 Be friendly, motivating, and concise. Max 180 words."""
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.7,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Groq summary error: {e}")
+        return f"Here's what I found about '{topic}'. Check the resources below!"
+
+
+def follow_up_with_groq(topic: str, user_question: str, summary: str) -> str:
+    """Answer a follow-up question about the topic using the previous context."""
+    prompt = f"""You are MindVault, an expert AI teacher. The user is learning about "{topic}".
+
+Previous summary:
+{summary}
+
+Now the user asks: "{user_question}"
+
+Answer clearly and helpfully. If the question is general, give a concise but informative reply. If you don't know, suggest checking the provided resources. Keep it under 200 words."""
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.7,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Groq follow-up error: {e}")
+        return "I'm having trouble generating a response right now. Please try again or ask something else."
 
 
 # ─── GROQ PDF TUTOR ──────────────────────────────────────────────────────────
+
 def tutor_with_groq(document_text: str, user_message: str, is_first: bool) -> str:
+    """Generate tutor responses for PDF sessions."""
     truncated = document_text[:6000]
 
     if is_first:
@@ -205,24 +192,25 @@ Student says: "{user_message}"
 - If confused, re-explain with a simpler example
 - Always end with a prompt to keep them engaged"""
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=600,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=600,
+            temperature=0.7,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Tutor error: {e}")
+        return "⚠️ Error generating tutor response. Please try again."
 
 
 # ─── FORMAT MESSAGE ───────────────────────────────────────────────────────────
-def format_message(topic: str, summary: str, archive: list, gutenberg: list, openlibrary: list, photographer: str | None) -> str:
-    msg = f"🧠 *MindVault — {topic.title()}*\n\n{summary}\n\n"
 
-    if archive:
-        msg += "📚 *Internet Archive:*\n"
-        for r in archive[:3]:
-            msg += f"📖 [{r['title']}]({r['link']})\n"
-        msg += "\n"
+def format_message(topic: str, summary: str, gutenberg: List[Dict], openlibrary: List[Dict],
+                   photographer: Optional[str]) -> str:
+    msg = f"🧠 *MindVault — {topic.title()}*\n\n{summary}\n\n"
 
     if gutenberg:
         msg += "📜 *Project Gutenberg (Free Books):*\n"
@@ -236,20 +224,25 @@ def format_message(topic: str, summary: str, archive: list, gutenberg: list, ope
             msg += f"📘 [{r['title']}]({r['link']})\n"
         msg += "\n"
 
+    if not gutenberg and not openlibrary:
+        msg += "⚠️ No free books found for this topic. Try uploading a PDF to get tutored!\n\n"
+
     if photographer:
         msg += f"📷 _Photo by {photographer} on Unsplash_\n\n"
 
-    msg += "💡 _Send me a PDF and I'll tutor you through it! /help for more._"
+    msg += "💡 *Ask me anything about this topic* — I'll answer! Or send a PDF for a full tutoring session. /help for more."
     return msg
 
 
 # ─── HANDLERS ────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to *MindVault* — your AI-powered learning assistant!\n\n"
         "🔍 *Learn any topic* — just type it!\n"
-        "📄 *Get free books* — from Gutenberg, Open Library & Internet Archive\n"
-        "📚 *Upload a PDF* — I'll tutor you through it section by section\n\n"
+        "📄 *Get free books* — from Gutenberg & Open Library\n"
+        "📚 *Upload a PDF* — I'll tutor you through it section by section\n"
+        "💬 *Follow‑up questions* — after a topic search, just ask anything about it!\n\n"
         "Try: `Python programming` or `Nigerian history` or `Quantum physics`\n\n"
         "Or send me a PDF to start a tutoring session! 🎓",
         parse_mode="Markdown"
@@ -265,10 +258,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `next` — move to next section\n"
         "• Ask any question about the document\n"
         "• /stop — end the session\n\n"
+        "*Topic follow‑up:* After a topic search, just ask anything about it (e.g., \"Tell me more about X\")\n\n"
         "*Commands:*\n"
         "/start — Welcome\n"
         "/help — This message\n"
-        "/stop — End tutoring session",
+        "/stop — End tutoring or clear topic session",
         parse_mode="Markdown"
     )
 
@@ -277,9 +271,9 @@ async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     if chat_id in tutor_sessions:
         del tutor_sessions[chat_id]
-        await update.message.reply_text("✅ Session ended. Type any topic to keep learning!")
-    else:
-        await update.message.reply_text("No active session. Type a topic to start learning!")
+    if chat_id in topic_sessions:
+        del topic_sessions[chat_id]
+    await update.message.reply_text("✅ Session ended. Type a topic or upload a PDF to start again!")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,6 +299,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_id = update.message.chat_id
         tutor_sessions[chat_id] = {"text": text, "filename": doc.file_name}
+        if chat_id in topic_sessions:
+            del topic_sessions[chat_id]
 
         response = tutor_with_groq(text, "", is_first=True)
         await update.message.reply_text(
@@ -324,7 +320,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # Active tutor session
+    # ── Active PDF tutor session ──
     if chat_id in tutor_sessions:
         session = tutor_sessions[chat_id]
         try:
@@ -339,68 +335,75 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Error generating response. Please try again.")
         return
 
-    # Topic search
+    # ── Follow‑up on previous topic search ──
+    if chat_id in topic_sessions:
+        session = topic_sessions[chat_id]
+        try:
+            response = follow_up_with_groq(session["topic"], text, session["summary"])
+            await update.message.reply_text(
+                f"🤔 *Follow‑up on {session['topic'].title()}*\n\n{response}\n\n"
+                "_You can keep asking, or type a new topic to start fresh._",
+                parse_mode="Markdown"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Follow-up error: {e}")
+            await update.message.reply_text("⚠️ Error generating follow-up. Please try again.")
+            return
+
+    # ── New topic search ──
     topic = text
     await update.message.reply_text(f"🔍 Researching *{topic}*...", parse_mode="Markdown")
 
     try:
-        # Run searches concurrently with timeout
-        archive_task = search_internet_archive(topic)
-        gutenberg_task = search_gutenberg(topic)
-        openlibrary_task = search_open_library(topic)
-        image_task = fetch_unsplash_image(topic)
+        # Run searches concurrently with timeouts
+        gutenberg_task = asyncio.wait_for(search_gutenberg(topic), timeout=10)
+        openlibrary_task = asyncio.wait_for(search_open_library(topic), timeout=10)
+        image_task = asyncio.wait_for(fetch_unsplash_image(topic), timeout=5)
 
-        results = await asyncio.gather(
-            archive_task, gutenberg_task, openlibrary_task, image_task,
+        gutenberg_results, openlibrary_results, image_data = await asyncio.gather(
+            gutenberg_task, openlibrary_task, image_task,
             return_exceptions=True
         )
 
-        archive_results = results[0] if not isinstance(results[0], Exception) else []
-        gutenberg_results = results[1] if not isinstance(results[1], Exception) else []
-        openlibrary_results = results[2] if not isinstance(results[2], Exception) else []
-        image_data = results[3] if not isinstance(results[3], Exception) else (None, None)
-        image_url, photographer = image_data if isinstance(image_data, tuple) else (None, None)
+        # Handle errors
+        if isinstance(gutenberg_results, Exception):
+            logger.error(f"Gutenberg error: {gutenberg_results}")
+            gutenberg_results = []
+        if isinstance(openlibrary_results, Exception):
+            logger.error(f"Open Library error: {openlibrary_results}")
+            openlibrary_results = []
+        if isinstance(image_data, Exception) or not isinstance(image_data, tuple):
+            image_url, photographer = None, None
+        else:
+            image_url, photographer = image_data
 
-        # Summarize
-        summary = summarize_with_groq(topic, archive_results, gutenberg_results, openlibrary_results)
-        message = format_message(topic, summary, archive_results, gutenberg_results, openlibrary_results, photographer)
+        # Generate summary
+        summary = summarize_with_groq(topic, gutenberg_results, openlibrary_results)
 
-        # Send image + message
+        # Store topic session for follow-ups
+        topic_sessions[chat_id] = {
+            "topic": topic,
+            "summary": summary,
+            "resources": {
+                "gutenberg": gutenberg_results,
+                "openlibrary": openlibrary_results,
+            }
+        }
+        if chat_id in tutor_sessions:
+            del tutor_sessions[chat_id]
+
+        # Build and send response
+        message = format_message(topic, summary, gutenberg_results, openlibrary_results, photographer)
         if image_url:
             await update.message.reply_photo(photo=image_url, caption=message, parse_mode="Markdown")
         else:
             await update.message.reply_text(message, parse_mode="Markdown")
 
-        # Try to send a PDF from Gutenberg (non-blocking)
-        pdf_sent = False
-        for book in gutenberg_results:
-            if book.get("download"):
-                await update.message.reply_text("📥 _Downloading a free book for you..._", parse_mode="Markdown")
-                try:
-                    pdf_bytes = await asyncio.wait_for(
-                        download_gutenberg_pdf(book["download"]), timeout=20
-                    )
-                    if pdf_bytes:
-                        ext = "epub" if "epub" in book["download"] else "pdf"
-                        await update.message.reply_document(
-                            document=io.BytesIO(pdf_bytes),
-                            filename=f"{topic}.{ext}",
-                            caption=f"📗 *{book['title']}*\n_Free from Project Gutenberg_",
-                            parse_mode="Markdown"
-                        )
-                        pdf_sent = True
-                        break
-                except asyncio.TimeoutError:
-                    logger.warning("Gutenberg download timed out")
-                    break
-
-        if not pdf_sent:
-            await update.message.reply_text(
-                "📄 _No direct download available for this topic, but check the links above for free books!_\n\n"
-                "💡 _You can also send me your own PDF and I'll tutor you through it!_",
-                parse_mode="Markdown"
-            )
-
+    except asyncio.TimeoutError:
+        await update.message.reply_text(
+            "⏰ The search took too long. Please try again with a more specific topic or upload a PDF for tutoring."
+        )
     except Exception as e:
         logger.error(f"Topic search error: {e}")
         await update.message.reply_text(
@@ -409,6 +412,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── PING SERVER ─────────────────────────────────────────────────────────────
+
 class PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -427,6 +431,7 @@ def run_ping_server():
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
+
 def main():
     ping_thread = threading.Thread(target=run_ping_server, daemon=True)
     ping_thread.start()
