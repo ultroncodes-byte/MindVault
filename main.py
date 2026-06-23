@@ -9,6 +9,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from groq import Groq
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,10 +26,10 @@ tutor_sessions: Dict[int, Dict[str, Any]] = {}
 topic_sessions: Dict[int, Dict[str, Any]] = {}
 
 
-# ─── SEARCH APIS (reliable and fast) ──────────────────────────────────────
+# ─── BOOK SEARCH APIS ──────────────────────────────────────────────────────
 
 async def search_gutenberg(topic: str) -> List[Dict[str, Optional[str]]]:
-    """Search Project Gutenberg via gutendex.com (free, fast, returns downloadable formats)."""
+    """Search Project Gutenberg via gutendex.com."""
     url = f"https://gutendex.com/books/?search={topic}"
     try:
         async with httpx.AsyncClient(timeout=8) as client:
@@ -41,11 +42,11 @@ async def search_gutenberg(topic: str) -> List[Dict[str, Optional[str]]]:
                 authors = book.get("authors", [])
                 author = authors[0]["name"] if authors else "Unknown"
                 formats = book.get("formats", {})
-                # Prefer PDF, then EPUB, then HTML
                 download_url = formats.get("application/pdf") or formats.get("application/epub+zip") or formats.get("text/html")
                 book_id = book.get("id")
                 page_link = f"https://www.gutenberg.org/ebooks/{book_id}"
                 results.append({
+                    "source": "Project Gutenberg",
                     "title": f"{title} — {author}",
                     "link": page_link,
                     "download": download_url,
@@ -71,13 +72,49 @@ async def search_open_library(topic: str) -> List[Dict[str, Optional[str]]]:
                 olid = doc.get("key", "")
                 link = f"https://openlibrary.org{olid}"
                 results.append({
+                    "source": "Open Library",
                     "title": f"{title} — {author}",
                     "link": link,
-                    "download": None,   # Open Library does not provide direct PDF download via API easily
+                    "download": None,
                 })
             return results
     except Exception as e:
         logger.error(f"Open Library error: {e}")
+        return []
+
+
+async def search_pdf_drive(topic: str) -> List[Dict[str, Optional[str]]]:
+    """Scrape PDF Drive for free PDF books (no official API)."""
+    url = f"https://www.pdfdrive.com/search?q={topic}"
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return []
+            soup = BeautifulSoup(resp.text, "lxml")
+            # Each result is in a <div class="file-right"> or similar
+            # Modern structure: <div class="file-info"> with <a> inside
+            items = soup.select("div.file-info")
+            for item in items[:3]:
+                link_tag = item.find("a", href=True)
+                if not link_tag:
+                    continue
+                title = link_tag.get_text(strip=True) or "Unknown"
+                href = link_tag["href"]
+                full_link = f"https://www.pdfdrive.com{href}" if href.startswith("/") else href
+                # Try to get author from the <span> with class "author"
+                author_tag = item.find("span", class_="author")
+                author = author_tag.get_text(strip=True) if author_tag else "Unknown"
+                results.append({
+                    "source": "PDF Drive",
+                    "title": f"{title} — {author}",
+                    "link": full_link,
+                    "download": full_link,  # direct link to the book page (download button)
+                })
+            return results
+    except Exception as e:
+        logger.error(f"PDF Drive error: {e}")
         return []
 
 
@@ -100,137 +137,134 @@ async def fetch_unsplash_image(topic: str) -> Tuple[Optional[str], Optional[str]
         return None, None
 
 
-# ─── GROQ SUMMARIZER ─────────────────────────────────────────────────────────
+# ─── GROQ LEARNING PLAN GENERATOR ─────────────────────────────────────────
 
-def summarize_with_groq(topic: str, gutenberg: List[Dict], openlibrary: List[Dict]) -> str:
-    """Generate a learning summary from the found resources."""
-    gutenberg_text = "\n".join([f"- {r['title']}: {r['link']}" for r in gutenberg]) or "None"
-    openlibrary_text = "\n".join([f"- {r['title']}: {r['link']}" for r in openlibrary]) or "None"
+def generate_learning_plan(topic: str, resources: List[Dict]) -> Dict[str, str]:
+    """
+    Uses Groq to:
+    - Select the best book from the resources.
+    - Generate a step-by-step learning plan aligned with that book.
+    Returns a dict with 'plan', 'recommended_book_title', 'recommended_book_link'.
+    """
+    if not resources:
+        return {
+            "plan": f"I couldn't find any free books for '{topic}'. Try uploading a PDF for tutoring!",
+            "recommended_book_title": None,
+            "recommended_book_link": None,
+        }
 
-    prompt = f"""You are MindVault, an expert AI learning assistant. The user wants to learn: "{topic}"
+    # Format resource list for the prompt
+    resource_text = "\n".join([
+        f"- [{r['source']}] {r['title']} (Link: {r['link']})"
+        for r in resources[:6]  # limit to top 6
+    ])
 
-Resources found:
-Project Gutenberg: {gutenberg_text}
-Open Library: {openlibrary_text}
+    prompt = f"""You are MindVault, an expert learning assistant. The user wants to learn: "{topic}".
 
-Write a learning summary with:
-1. A clear 2-3 sentence explanation of what "{topic}" is
-2. Why these resources are valuable for learning it
-3. One practical beginner tip
+Available books/resources:
+{resource_text}
 
-Be friendly, motivating, and concise. Max 180 words."""
+Your tasks:
+1. Select the SINGLE best book from the list that would be most suitable for a beginner to learn this topic. Provide the title and the link.
+2. Create a clear, step-by-step learning plan using that book. The plan should be a numbered list (e.g., 1. ..., 2. ...) with around 5–8 steps, covering foundational concepts, practice, and real-world application.
 
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.7,
-            timeout=15,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Groq summary error: {e}")
-        return f"Here's what I found about '{topic}'. Check the resources below!"
-
-
-def follow_up_with_groq(topic: str, user_question: str, summary: str) -> str:
-    """Answer a follow-up question about the topic using the previous context."""
-    prompt = f"""You are MindVault, an expert AI teacher. The user is learning about "{topic}".
-
-Previous summary:
-{summary}
-
-Now the user asks: "{user_question}"
-
-Answer clearly and helpfully. If the question is general, give a concise but informative reply. If you don't know, suggest checking the provided resources. Keep it under 200 words."""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.7,
-            timeout=15,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Groq follow-up error: {e}")
-        return "I'm having trouble generating a response right now. Please try again or ask something else."
-
-
-# ─── GROQ PDF TUTOR ──────────────────────────────────────────────────────────
-
-def tutor_with_groq(document_text: str, user_message: str, is_first: bool) -> str:
-    """Generate tutor responses for PDF sessions."""
-    truncated = document_text[:6000]
-
-    if is_first:
-        prompt = f"""You are MindVault Tutor — an expert AI teacher. A student uploaded a document.
-
-Document:
----
-{truncated}
----
-
-1. Give a warm welcome and brief overview (2-3 sentences)
-2. List the KEY topics you will teach
-3. Start teaching the FIRST topic with examples
-4. End by asking if they are ready for the next section or have questions
-
-Be engaging and use simple language."""
-    else:
-        prompt = f"""You are MindVault Tutor teaching a student from this document:
----
-{truncated}
----
-
-Student says: "{user_message}"
-
-- If they say "next", teach the next concept
-- If they ask a question, answer clearly from the document
-- If confused, re-explain with a simpler example
-- Always end with a prompt to keep them engaged"""
+Output format (exactly):
+Recommended Book: [title] (Link: [link])
+Learning Plan:
+1. [Step 1]
+2. [Step 2]
+...
+"""
 
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=600,
-            temperature=0.7,
+            temperature=0.6,
             timeout=15,
         )
-        return response.choices[0].message.content.strip()
+        output = response.choices[0].message.content.strip()
+
+        # Parse the response to extract book and plan
+        lines = output.split("\n")
+        plan_lines = []
+        recommended_book_title = None
+        recommended_book_link = None
+        in_plan = False
+        for line in lines:
+            if line.startswith("Recommended Book:"):
+                # Extract title and link
+                # Example: "Recommended Book: Python Crash Course (Link: https://..."
+                book_part = line.replace("Recommended Book:", "").strip()
+                if "(Link:" in book_part:
+                    title_part, link_part = book_part.split("(Link:", 1)
+                    recommended_book_title = title_part.strip()
+                    link_part = link_part.rstrip(")").strip()
+                    recommended_book_link = link_part
+                else:
+                    recommended_book_title = book_part
+            elif line.startswith("Learning Plan:"):
+                in_plan = True
+            elif in_plan and line.strip():
+                plan_lines.append(line.strip())
+
+        # If parsing failed, use the whole output as plan
+        if not plan_lines and not recommended_book_title:
+            # Fallback: treat everything after "Learning Plan:" as plan
+            full_plan = output
+            # Try to extract a book link from the first line if possible
+            return {
+                "plan": full_plan,
+                "recommended_book_title": None,
+                "recommended_book_link": None,
+            }
+
+        plan_text = "\n".join(plan_lines) if plan_lines else "Plan not available."
+        return {
+            "plan": plan_text,
+            "recommended_book_title": recommended_book_title,
+            "recommended_book_link": recommended_book_link,
+        }
     except Exception as e:
-        logger.error(f"Tutor error: {e}")
-        return "⚠️ Error generating tutor response. Please try again."
+        logger.error(f"Groq learning plan error: {e}")
+        return {
+            "plan": f"I found some books for '{topic}', but I couldn't generate a plan. Check the resources below!",
+            "recommended_book_title": None,
+            "recommended_book_link": None,
+        }
 
 
 # ─── FORMAT MESSAGE ───────────────────────────────────────────────────────────
 
-def format_message(topic: str, summary: str, gutenberg: List[Dict], openlibrary: List[Dict],
+def format_message(topic: str, plan_info: Dict, resources: List[Dict],
                    photographer: Optional[str]) -> str:
-    msg = f"🧠 *MindVault — {topic.title()}*\n\n{summary}\n\n"
+    plan = plan_info.get("plan", "No plan generated.")
+    rec_title = plan_info.get("recommended_book_title")
+    rec_link = plan_info.get("recommended_book_link")
 
-    if gutenberg:
-        msg += "📜 *Project Gutenberg (Free Books):*\n"
-        for r in gutenberg:
-            msg += f"📗 [{r['title']}]({r['link']})\n"
+    msg = f"🧠 *MindVault — {topic.title()}*\n\n"
+    msg += f"📚 *Recommended Book:* "
+    if rec_title and rec_link:
+        msg += f"[{rec_title}]({rec_link})\n\n"
+    else:
+        msg += "None selected.\n\n"
+
+    msg += f"📖 *Step‑by‑Step Learning Plan:*\n{plan}\n\n"
+
+    # List all resources found
+    if resources:
+        msg += "📌 *All Resources Found:*\n"
+        for r in resources[:6]:
+            msg += f"• [{r['source']}] [{r['title']}]({r['link']})\n"
         msg += "\n"
-
-    if openlibrary:
-        msg += "🏛️ *Open Library:*\n"
-        for r in openlibrary:
-            msg += f"📘 [{r['title']}]({r['link']})\n"
-        msg += "\n"
-
-    if not gutenberg and not openlibrary:
+    else:
         msg += "⚠️ No free books found for this topic. Try uploading a PDF to get tutored!\n\n"
 
     if photographer:
         msg += f"📷 _Photo by {photographer} on Unsplash_\n\n"
 
-    msg += "💡 *Ask me anything about this topic* — I'll answer! Or send a PDF for a full tutoring session. /help for more."
+    msg += "💡 *Ask follow‑up questions* – I'll answer based on this plan! Or send a PDF for a full tutoring session. /help for more."
     return msg
 
 
@@ -238,13 +272,13 @@ def format_message(topic: str, summary: str, gutenberg: List[Dict], openlibrary:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome to *MindVault* — your AI-powered learning assistant!\n\n"
+        "👋 Welcome to *MindVault* — your AI learning assistant!\n\n"
         "🔍 *Learn any topic* — just type it!\n"
-        "📄 *Get free books* — from Gutenberg & Open Library\n"
-        "📚 *Upload a PDF* — I'll tutor you through it section by section\n"
-        "💬 *Follow‑up questions* — after a topic search, just ask anything about it!\n\n"
-        "Try: `Python programming` or `Nigerian history` or `Quantum physics`\n\n"
-        "Or send me a PDF to start a tutoring session! 🎓",
+        "📚 I'll search free books from Gutenberg, Open Library, and PDF Drive.\n"
+        "🧠 Then I'll create a *step‑by‑step learning plan* with the best book.\n\n"
+        "💬 Ask follow‑up questions about the plan.\n"
+        "📄 Upload a PDF for one‑on‑one tutoring.\n\n"
+        "Try: `Python programming` or `Nigerian history`",
         parse_mode="Markdown"
     )
 
@@ -253,16 +287,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🆘 *MindVault Help*\n\n"
         "*Learn a topic:* Just type any subject\n"
-        "*Get tutored:* Send any PDF file\n\n"
-        "*During tutoring:*\n"
-        "• `next` — move to next section\n"
-        "• Ask any question about the document\n"
-        "• /stop — end the session\n\n"
-        "*Topic follow‑up:* After a topic search, just ask anything about it (e.g., \"Tell me more about X\")\n\n"
-        "*Commands:*\n"
-        "/start — Welcome\n"
-        "/help — This message\n"
-        "/stop — End tutoring or clear topic session",
+        "*Get a plan:* I'll recommend a book and give you a step‑by‑step learning roadmap.\n"
+        "*Follow‑up:* Ask anything about the topic or the plan.\n"
+        "*Upload PDF:* Get tutored through the document.\n\n"
+        "*Commands:*\n/start — Welcome\n/help — This\n/stop — End sessions",
         parse_mode="Markdown"
     )
 
@@ -273,7 +301,7 @@ async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del tutor_sessions[chat_id]
     if chat_id in topic_sessions:
         del topic_sessions[chat_id]
-    await update.message.reply_text("✅ Session ended. Type a topic or upload a PDF to start again!")
+    await update.message.reply_text("✅ Session ended. Start a new topic or upload a PDF.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -313,6 +341,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Error reading document. Please try again.")
 
 
+def tutor_with_groq(document_text: str, user_message: str, is_first: bool) -> str:
+    """Generate tutor responses for PDF sessions (unchanged)."""
+    truncated = document_text[:6000]
+    if is_first:
+        prompt = f"""You are MindVault Tutor — an expert AI teacher. A student uploaded a document.
+
+Document:
+---
+{truncated}
+---
+
+1. Give a warm welcome and brief overview (2-3 sentences)
+2. List the KEY topics you will teach
+3. Start teaching the FIRST topic with examples
+4. End by asking if they are ready for the next section or have questions
+
+Be engaging and use simple language."""
+    else:
+        prompt = f"""You are MindVault Tutor teaching a student from this document:
+---
+{truncated}
+---
+
+Student says: "{user_message}"
+
+- If they say "next", teach the next concept
+- If they ask a question, answer clearly from the document
+- If confused, re-explain with a simpler example
+- Always end with a prompt to keep them engaged"""
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=600,
+            temperature=0.7,
+            timeout=15,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Tutor error: {e}")
+        return "⚠️ Error generating tutor response. Please try again."
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     text = update.message.text.strip()
@@ -335,14 +406,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Error generating response. Please try again.")
         return
 
-    # ── Follow‑up on previous topic search ──
+    # ── Follow‑up on previous topic (plan or book) ──
     if chat_id in topic_sessions:
         session = topic_sessions[chat_id]
+        # If the user asks a short question, treat as follow-up using the stored plan and resources
         try:
-            response = follow_up_with_groq(session["topic"], text, session["summary"])
+            follow_up_prompt = f"""You are MindVault. The user is learning "{session['topic']}".
+The learning plan we created is:
+{session['plan']}
+
+Recommended book: {session.get('recommended_book') or 'Not specified'}
+
+User asks: "{text}"
+
+Answer clearly, referencing the plan or book if relevant. Keep it under 250 words.
+"""
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": follow_up_prompt}],
+                max_tokens=400,
+                temperature=0.7,
+                timeout=15,
+            )
+            answer = response.choices[0].message.content.strip()
             await update.message.reply_text(
-                f"🤔 *Follow‑up on {session['topic'].title()}*\n\n{response}\n\n"
-                "_You can keep asking, or type a new topic to start fresh._",
+                f"🤔 *Follow‑up on {session['topic'].title()}*\n\n{answer}\n\n"
+                "_Keep asking, or type a new topic to start fresh._",
                 parse_mode="Markdown"
             )
             return
@@ -356,13 +445,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔍 Researching *{topic}*...", parse_mode="Markdown")
 
     try:
-        # Run searches concurrently with timeouts
+        # Search all three sources concurrently
         gutenberg_task = asyncio.wait_for(search_gutenberg(topic), timeout=10)
         openlibrary_task = asyncio.wait_for(search_open_library(topic), timeout=10)
+        pdfdrive_task = asyncio.wait_for(search_pdf_drive(topic), timeout=12)
         image_task = asyncio.wait_for(fetch_unsplash_image(topic), timeout=5)
 
-        gutenberg_results, openlibrary_results, image_data = await asyncio.gather(
-            gutenberg_task, openlibrary_task, image_task,
+        gutenberg_results, openlibrary_results, pdfdrive_results, image_data = await asyncio.gather(
+            gutenberg_task, openlibrary_task, pdfdrive_task, image_task,
             return_exceptions=True
         )
 
@@ -373,28 +463,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if isinstance(openlibrary_results, Exception):
             logger.error(f"Open Library error: {openlibrary_results}")
             openlibrary_results = []
+        if isinstance(pdfdrive_results, Exception):
+            logger.error(f"PDF Drive error: {pdfdrive_results}")
+            pdfdrive_results = []
         if isinstance(image_data, Exception) or not isinstance(image_data, tuple):
             image_url, photographer = None, None
         else:
             image_url, photographer = image_data
 
-        # Generate summary
-        summary = summarize_with_groq(topic, gutenberg_results, openlibrary_results)
+        # Combine all resources
+        all_resources = gutenberg_results + openlibrary_results + pdfdrive_results
 
-        # Store topic session for follow-ups
+        # Generate learning plan
+        plan_info = generate_learning_plan(topic, all_resources)
+
+        # Store session for follow-ups
         topic_sessions[chat_id] = {
             "topic": topic,
-            "summary": summary,
-            "resources": {
-                "gutenberg": gutenberg_results,
-                "openlibrary": openlibrary_results,
-            }
+            "plan": plan_info.get("plan", ""),
+            "recommended_book": plan_info.get("recommended_book_title"),
+            "resources": all_resources,
         }
         if chat_id in tutor_sessions:
             del tutor_sessions[chat_id]
 
         # Build and send response
-        message = format_message(topic, summary, gutenberg_results, openlibrary_results, photographer)
+        message = format_message(topic, plan_info, all_resources, photographer)
         if image_url:
             await update.message.reply_photo(photo=image_url, caption=message, parse_mode="Markdown")
         else:
@@ -444,7 +538,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("MindVault bot is running...")
+    logger.info("MindVault bot is running with learning plans!")
     app.run_polling(drop_pending_updates=True)
 
 
